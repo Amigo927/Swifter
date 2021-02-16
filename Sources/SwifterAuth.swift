@@ -22,9 +22,7 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 //  THE SOFTWARE.
 //
-
 import Foundation
-import AuthenticationServices
 
 #if os(iOS)
     import UIKit
@@ -37,39 +35,7 @@ public extension Swifter {
     
     typealias TokenSuccessHandler = (Credential.OAuthAccessToken?, URLResponse) -> Void
     typealias SSOTokenSuccessHandler = (Credential.OAuthAccessToken) -> Void
-
-    /**
-     Begin Authorization with a Callback URL
-     - for macOS and iOS
-     */
-    #if os(macOS) || os(iOS)
-    @available(macOS 10.15, *)
-    @available(iOS 13.0, *)
-    func authorize(withProvider provider: ASWebAuthenticationPresentationContextProviding,
-                   ephemeralSession: Bool = false,
-                   callbackURL: URL,
-                   forceLogin: Bool = false,
-                   success: TokenSuccessHandler?,
-                   failure: FailureHandler? = nil) {
-        let callbackURLScheme = callbackURL.absoluteString.components(separatedBy: "://").first
-        self.postOAuthRequestToken(with: callbackURL, success: { token, response in
-            let queryURL = self.makeQueryURL(tokenKey: token!.key, forceLogin: forceLogin)
-            let session = ASWebAuthenticationSession(url: queryURL, callbackURLScheme: callbackURLScheme) { (url, error) in
-                self.session = nil
-                if let error = error {
-                    failure?(error)
-                    return
-                }
-                self.postOAuthAccessTokenHelper(requestToken: token!, responseURL: url!, success: success, failure: failure)
-            }
-            session.presentationContextProvider = provider
-            session.prefersEphemeralWebBrowserSession = ephemeralSession
-            session.start()
-            self.session = session
-        }, failure: failure)
-    }
-    #endif
-
+    
     /**
      Begin Authorization with a Callback URL.
      - OS X only
@@ -80,13 +46,24 @@ public extension Swifter {
                    success: TokenSuccessHandler?,
                    failure: FailureHandler? = nil) {
         self.postOAuthRequestToken(with: callbackURL, success: { token, response in
+            var requestToken = token!
+            
             NotificationCenter.default.addObserver(forName: .swifterCallback, object: nil, queue: .main) { notification in
                 NotificationCenter.default.removeObserver(self)
                 let url = notification.userInfo![CallbackNotification.optionsURLKey] as! URL
-                self.postOAuthAccessTokenHelper(requestToken: token!, responseURL: url, success: success, failure: failure)
+                let parameters = url.query!.queryStringParameters
+                requestToken.verifier = parameters["oauth_verifier"]
+                
+                    self.postOAuthAccessToken(with: requestToken, success: { accessToken, response in
+                    self.client.credential = Credential(accessToken: accessToken!)
+                    success?(accessToken!, response)
+                    }, failure: failure)
             }
-            let queryURL = self.makeQueryURL(tokenKey: token!.key, forceLogin: forceLogin)
-            NSWorkspace.shared.open(queryURL)
+			
+			let forceLogin = forceLogin ? "&force_login=true" : ""
+			let query = "oauth/authorize?oauth_token=\(token!.key)\(forceLogin)"
+			let queryUrl = URL(string: query, relativeTo: TwitterURL.oauth.url)!.absoluteURL
+            NSWorkspace.shared.open(queryUrl)
         }, failure: failure)
     }
     #endif
@@ -98,8 +75,8 @@ public extension Swifter {
      The UIViewController must inherit SFSafariViewControllerDelegate
      
      */
+    
     #if os(iOS)
-    @available(iOS, deprecated: 13.0)
     func authorize(withCallback callbackURL: URL,
                    presentingFrom presenting: UIViewController?,
                    forceLogin: Bool = false,
@@ -107,27 +84,37 @@ public extension Swifter {
                    success: TokenSuccessHandler?,
                    failure: FailureHandler? = nil) {
         self.postOAuthRequestToken(with: callbackURL, success: { token, response in
+            var requestToken = token!
             self.swifterCallbackToken = NotificationCenter.default.addObserver(forName: .swifterCallback, object: nil, queue: .main) { notification in
                 self.swifterCallbackToken = nil
                 presenting?.presentedViewController?.dismiss(animated: true, completion: nil)
                 let url = notification.userInfo![CallbackNotification.optionsURLKey] as! URL
-                self.postOAuthAccessTokenHelper(requestToken: token!, responseURL: url, success: success, failure: failure)
+                
+                let parameters = url.query!.queryStringParameters
+                requestToken.verifier = parameters["oauth_verifier"]
+                
+                self.postOAuthAccessToken(with: requestToken, success: { accessToken, response in
+                    self.client.credential = Credential(accessToken: accessToken!)
+                    success?(accessToken!, response)
+                    }, failure: failure)
             }
-
-            let queryURL = self.makeQueryURL(tokenKey: token!.key, forceLogin: forceLogin)
+			
+			let forceLogin = forceLogin ? "&force_login=true" : ""
+			let query = "oauth/authorize?oauth_token=\(token!.key)\(forceLogin)"
+            let queryUrl = URL(string: query, relativeTo: TwitterURL.oauth.url)!.absoluteURL
 			
             if let delegate = safariDelegate ?? (presenting as? SFSafariViewControllerDelegate) {
-                let safariView = SFSafariViewController(url: queryURL)
+                let safariView = SFSafariViewController(url: queryUrl)
                 safariView.delegate = delegate
                 safariView.modalTransitionStyle = .coverVertical
                 safariView.modalPresentationStyle = .overFullScreen
                 presenting?.present(safariView, animated: true, completion: nil)
             } else {
-                UIApplication.shared.open(queryURL, options: [:], completionHandler: nil)
+                UIApplication.shared.open(queryUrl, options: [:], completionHandler: nil)
             }
         }, failure: failure)
     }
-
+  
     func authorizeSSO(success: SSOTokenSuccessHandler?, failure: FailureHandler? = nil) {
         guard let client = client as? SwifterAppProtocol else {
             let error = SwifterError(message: "SSO not supported AppOnly client",
@@ -136,7 +123,7 @@ public extension Swifter {
             return
         }
         
-        let urlScheme = "swifter-\(client.consumerKey)"
+        let urlScheme = "twitterkit-\(client.consumerKey)"
         
         let nc = NotificationCenter.default
         self.swifterCallbackToken = nc.addObserver(forName: .swifterSSOCallback, object: nil, queue: .main) { notification in
@@ -152,7 +139,9 @@ public extension Swifter {
                 let params = url.queryParamsForSSO
                 let secret = params["secret"]!
                 let token = params["token"]!
-                let credentialToken = Credential.OAuthAccessToken(key: token, secret: secret)
+              // 追加
+                let screenName = params["username"]
+              let credentialToken = Credential.OAuthAccessToken(key: token, secret: secret, screenName: screenName)
                 self.client.credential = Credential(accessToken: credentialToken)
                 success?(credentialToken)
             }
@@ -161,18 +150,14 @@ public extension Swifter {
         let url = URL(string: "twitterauth://authorize?consumer_key=\(client.consumerKey)&consumer_secret=\(client.consumerSecret)&oauth_callback=\(urlScheme)")!
         UIApplication.shared.open(url, options: [:], completionHandler: { (success) in
             if !success {
-                let error = SwifterError(message: "Cannot open twitter app", kind: .noTwitterApp)
+                let error = SwifterError(message: "Cannot open twitter app",
+                                         kind: .noTwitterApp)
                 failure?(error)
             }
         })
     }
+    
     #endif
-
-    func makeQueryURL(tokenKey: String, forceLogin: Bool) -> URL {
-        let forceLogin = forceLogin ? "&force_login=true" : ""
-        let query = "oauth/authorize?oauth_token=\(tokenKey)\(forceLogin)"
-        return URL(string: query, relativeTo: TwitterURL.oauth.url)!.absoluteURL
-    }
 
     @discardableResult
     class func handleOpenURL(_ url: URL, callbackURL: URL, isSSO: Bool = false) -> Bool {
@@ -268,25 +253,5 @@ public extension Swifter {
             failure?(error)
         }
     }
-
-    private func postOAuthAccessTokenHelper(
-        requestToken token: Credential.OAuthAccessToken,
-        responseURL: URL,
-        success: TokenSuccessHandler?,
-        failure: FailureHandler? = nil
-    ) {
-        let parameters = responseURL.query!.queryStringParameters
-        guard let verifier = parameters["oauth_verifier"] else {
-            let error = SwifterError(message: "User cancelled login from Twitter App", kind: .cancelled)
-            failure?(error)
-            return
-        }
-        var requestToken = token
-        requestToken.verifier = verifier
-        self.postOAuthAccessToken(with: requestToken, success: { accessToken, response in
-            self.client.credential = Credential(accessToken: accessToken!)
-            success?(accessToken!, response)
-        }, failure: failure)
-    }
-
+    
 }
