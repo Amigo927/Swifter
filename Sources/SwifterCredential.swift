@@ -22,7 +22,6 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 //  THE SOFTWARE.
 //
-
 import Foundation
 
 #if os(macOS) || os(iOS)
@@ -39,11 +38,12 @@ public class Credential {
         
         public internal(set) var screenName: String?
         public internal(set) var userID: String?
-        
-        public init(key: String, secret: String) {
+      // screenName param追加
+      public init(key: String, secret: String, screenName: String? = nil) {
             self.key = key
             self.secret = secret
             self.userID = key.components(separatedBy: "-").first
+            self.screenName = screenName
         }
         
         public init(queryString: String) {
